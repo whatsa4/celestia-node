@@ -31,25 +31,18 @@ Steps:
 Note: 15 is not available because DASer will be stopped before reaching this height due to receiving a fraud proof.
 */
 func TestFraudProofBroadcasting(t *testing.T) {
-	// we increase the timeout for this test to decrease flakiness in CI
-	testTimeout := time.Millisecond * 200
-	sw := swamp.NewSwamp(t, swamp.WithBlockTime(testTimeout))
-
-	bridge := sw.NewBridgeNode(core.WithHeaderConstructFn(header.FraudMaker(t, 20)))
-
 	ctx, cancel := context.WithTimeout(context.Background(), swamp.DefaultTestTimeout)
 	t.Cleanup(cancel)
 
+	sw := swamp.NewSwamp(t, swamp.WithBlockTime(blockTime))
+
+	bridge := sw.NewBridgeNode(core.WithHeaderConstructFn(header.FraudMaker(t, 20)))
 	err := bridge.Start(ctx)
-	require.NoError(t, err)
-	addrs, err := peer.AddrInfoToP2pAddrs(host.InfoFromHost(bridge.Host))
 	require.NoError(t, err)
 
 	cfg := nodebuilder.DefaultConfig(node.Full)
-	cfg.Header.TrustedPeers = append(cfg.Header.TrustedPeers, addrs[0].String())
 	store := nodebuilder.MockStore(t, cfg)
 	full := sw.NewNodeWithStore(node.Full, store)
-
 	err = full.Start(ctx)
 	require.NoError(t, err)
 
@@ -58,24 +51,30 @@ func TestFraudProofBroadcasting(t *testing.T) {
 	subscr, err := full.FraudServ.Subscribe(ctx, fraud.BadEncoding)
 	require.NoError(t, err)
 
-	p := <-subscr
-	require.Equal(t, 20, int(p.Height()))
+	select {
+	case p := <-subscr:
+		require.Equal(t, 20, int(p.Height()))
+	case <-ctx.Done():
+		t.Fatal("fraud proof was not received in time")
+	}
 
 	// This is an obscure way to check if the Syncer was stopped.
 	// If we cannot get a height header within a timeframe it means the syncer was stopped
 	// FIXME: Eventually, this should be a check on service registry managing and keeping
 	//  lifecycles of each Module.
-	syncCtx, syncCancel := context.WithTimeout(context.Background(), testTimeout)
+	syncCtx, syncCancel := context.WithTimeout(context.Background(), time.Millisecond*200)
 	_, err = full.HeaderServ.GetByHeight(syncCtx, 100)
 	require.ErrorIs(t, err, context.DeadlineExceeded)
 	syncCancel()
 
-	require.NoError(t, full.Stop(ctx))
-	require.NoError(t, sw.RemoveNode(full, node.Full))
+	err = full.Stop(ctx)
+	require.NoError(t, err)
+	sw.RemoveNode(full, node.Full)
 
 	full = sw.NewNodeWithStore(node.Full, store)
+	err = full.Start(ctx)
+	require.Error(t, err)
 
-	require.Error(t, full.Start(ctx))
 	proofs, err := full.FraudServ.Get(ctx, fraud.BadEncoding)
 	require.NoError(t, err)
 	require.NotNil(t, proofs)
@@ -95,7 +94,7 @@ Steps:
 7. Wait until LN will be connected to FN and fetch a fraud proof.
 */
 func TestFraudProofSyncing(t *testing.T) {
-	sw := swamp.NewSwamp(t, swamp.WithBlockTime(time.Millisecond*300))
+	sw := swamp.NewSwamp(t, swamp.WithBlockTime(blockTime))
 
 	const defaultTimeInterval = time.Second * 5
 

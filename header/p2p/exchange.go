@@ -79,12 +79,11 @@ func (ex *Exchange) Start(context.Context) error {
 	return nil
 }
 
-func (ex *Exchange) Stop(context.Context) error {
+func (ex *Exchange) Stop(ctx context.Context) error {
 	// cancel the session if it exists
 	ex.cancel()
 	// stop the peerTracker
-	ex.peerTracker.stop()
-	return nil
+	return ex.peerTracker.stop(ctx)
 }
 
 // Head requests the latest ExtendedHeader. Note that the ExtendedHeader

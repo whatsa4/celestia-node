@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	mdutils "github.com/ipfs/go-merkledag/test"
 	"github.com/libp2p/go-libp2p-core/host"
 	"github.com/libp2p/go-libp2p-core/peer"
 	mocknet "github.com/libp2p/go-libp2p/p2p/net/mock"
@@ -16,6 +17,10 @@ import (
 	"github.com/tendermint/tendermint/libs/bytes"
 	tmrand "github.com/tendermint/tendermint/libs/rand"
 	"go.uber.org/fx"
+
+	"github.com/celestiaorg/celestia-node/core"
+	"github.com/celestiaorg/celestia-node/header"
+	headercore "github.com/celestiaorg/celestia-node/header/core"
 
 	"github.com/celestiaorg/celestia-app/testutil/testnode"
 
@@ -45,11 +50,12 @@ type Swamp struct {
 	BridgeNodes []*nodebuilder.Node
 	FullNodes   []*nodebuilder.Node
 	LightNodes  []*nodebuilder.Node
-	trustedHash string
 	comps       *Components
 
 	ClientContext testnode.Context
 	accounts      []string
+
+	genesis *header.ExtendedHeader
 }
 
 // NewSwamp creates a new instance of Swamp.
@@ -99,7 +105,6 @@ func NewSwamp(t *testing.T, options ...Option) *Swamp {
 		comps:         ic,
 		accounts:      accounts,
 	}
-	swp.trustedHash = swp.getTrustedHash(ctx)
 
 	swp.t.Cleanup(func() {
 		swp.stopAllNodes(ctx, swp.BridgeNodes, swp.FullNodes, swp.LightNodes)
@@ -109,6 +114,7 @@ func NewSwamp(t *testing.T, options ...Option) *Swamp {
 		require.NoError(t, err)
 	})
 
+	swp.setupGenesis(ctx)
 	return swp
 }
 
@@ -181,10 +187,20 @@ func (s *Swamp) createPeer(ks keystore.Keystore) host.Host {
 	return host
 }
 
-// getTrustedHash is needed for celestia nodes to get the trustedhash
-// from CoreClient. This is required to initialize and start correctly.
-func (s *Swamp) getTrustedHash(ctx context.Context) string {
-	return s.WaitTillHeight(ctx, 1).String()
+// setupGenesis sets up genesis Header.
+// This is required to initialize and start correctly.
+func (s *Swamp) setupGenesis(ctx context.Context) {
+	s.WaitTillHeight(ctx, 1)
+
+	ex := headercore.NewExchange(
+		core.NewBlockFetcher(s.ClientContext.Client),
+		mdutils.Bserv(),
+		header.MakeExtendedHeader,
+	)
+
+	h, err := ex.GetByHeight(ctx, 1)
+	require.NoError(s.t, err)
+	s.genesis = h
 }
 
 // NewBridgeNode creates a new instance of a BridgeNode providing a default config
@@ -259,7 +275,6 @@ func (s *Swamp) newNode(t node.Type, store nodebuilder.Store, options ...fx.Opti
 	// like <core, host, hash> from the test case, we need to check them and not use
 	// default that are set here
 	cfg, _ := store.Config()
-	cfg.Header.TrustedHash = s.trustedHash
 	cfg.RPC.Port = "0"
 
 	// tempDir is used for the eds.Store
@@ -267,32 +282,32 @@ func (s *Swamp) newNode(t node.Type, store nodebuilder.Store, options ...fx.Opti
 	options = append(options,
 		p2p.WithHost(s.createPeer(ks)),
 		fx.Replace(node.StorePath(tempDir)),
+		fx.Invoke(func(ctx context.Context, store header.Store) error {
+			return store.Init(ctx, s.genesis)
+		}),
 	)
 
 	node, err := nodebuilder.New(t, p2p.Private, store, options...)
 	require.NoError(s.t, err)
-
 	return node
 }
 
 // RemoveNode removes a node from the swamp's node slice
 // this allows reusage of the same var in the test scenario
 // if the user needs to stop and start the same node
-func (s *Swamp) RemoveNode(n *nodebuilder.Node, t node.Type) error {
+func (s *Swamp) RemoveNode(n *nodebuilder.Node, t node.Type) {
 	var err error
 	switch t {
 	case node.Light:
 		s.LightNodes, err = s.remove(n, s.LightNodes)
-		return err
 	case node.Bridge:
 		s.BridgeNodes, err = s.remove(n, s.BridgeNodes)
-		return err
 	case node.Full:
 		s.FullNodes, err = s.remove(n, s.FullNodes)
-		return err
 	default:
-		return fmt.Errorf("no such type or node")
+		panic("no such type or node")
 	}
+	require.NoError(s.t, err)
 }
 
 func (s *Swamp) remove(rn *nodebuilder.Node, sn []*nodebuilder.Node) ([]*nodebuilder.Node, error) {
@@ -315,18 +330,18 @@ func (s *Swamp) remove(rn *nodebuilder.Node, sn []*nodebuilder.Node) ([]*nodebui
 }
 
 // Connect allows to connect peers after hard disconnection.
-func (s *Swamp) Connect(t *testing.T, peerA, peerB peer.ID) {
+func (s *Swamp) Connect(peerA, peerB peer.ID) {
 	_, err := s.Network.LinkPeers(peerA, peerB)
-	require.NoError(t, err)
+	require.NoError(s.t, err)
 	_, err = s.Network.ConnectPeers(peerA, peerB)
-	require.NoError(t, err)
+	require.NoError(s.t, err)
 }
 
 // Disconnect allows to break a connection between two peers without any possibility to
 // re-establish it. Order is very important here. We have to unlink peers first, and only after
 // that call disconnect. This is hard disconnect and peers will not be able to reconnect.
 // In order to reconnect peers again, please use swamp.Connect
-func (s *Swamp) Disconnect(t *testing.T, peerA, peerB peer.ID) {
-	require.NoError(t, s.Network.UnlinkPeers(peerA, peerB))
-	require.NoError(t, s.Network.DisconnectPeers(peerA, peerB))
+func (s *Swamp) Disconnect(peerA, peerB peer.ID) {
+	require.NoError(s.t, s.Network.UnlinkPeers(peerA, peerB))
+	require.NoError(s.t, s.Network.DisconnectPeers(peerA, peerB))
 }
